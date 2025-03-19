@@ -1,0 +1,150 @@
+from understatapi import UnderstatClient
+import pandas as pd
+from scipy.stats import poisson
+import multiprocessing
+
+FIXTURES_URL = 'https://fixturedownload.com/feed/json/epl-2024'
+
+
+def create_fixtures_teams(url):
+    replacements = [
+        ('Spurs', 'Tottenham'), 
+        ('Man Utd', 'Manchester United'), 
+        ('Newcastle', 'Newcastle United'),
+        ('Man City', 'Manchester City'),
+        ('Wolves', 'Wolverhampton Wanderers'),
+        ("Nott'm Forest", 'Nottingham Forest')
+    ]
+    fixtures = pd.read_json(url, orient='records')
+    for pat, repl in replacements:
+        fixtures['HomeTeam'] = fixtures['HomeTeam'].str.replace(pat=pat, repl=repl)
+        fixtures['AwayTeam'] = fixtures['AwayTeam'].str.replace(pat=pat, repl=repl)
+    all_teams = fixtures['HomeTeam'].unique().tolist()
+    completed_fixtures = fixtures[~fixtures['HomeTeamScore'].isna()]
+    upcoming_fixtures = fixtures[fixtures['HomeTeamScore'].isna()].sort_values(by=['DateUtc', 'MatchNumber'])
+    upcoming_fixtures_list = upcoming_fixtures[['MatchNumber', 'HomeTeam', 'AwayTeam']].to_dict(orient='records')
+    return all_teams, completed_fixtures, upcoming_fixtures_list
+
+
+def create_team_record(team, completed_fixtures):
+    team_record = {}
+    team_record['name'] = team
+    team_record['played'] = completed_fixtures[completed_fixtures['HomeTeam'] == team].shape[0] + completed_fixtures[completed_fixtures['AwayTeam'] == team].shape[0]
+    team_record['wins'] = completed_fixtures.query(f'HomeTeam == "{team}" & HomeTeamScore > AwayTeamScore').shape[0] + completed_fixtures.query(f'AwayTeam == "{team}" & HomeTeamScore < AwayTeamScore').shape[0]
+    team_record['draws'] = completed_fixtures.query(f'HomeTeam == "{team}" & HomeTeamScore == AwayTeamScore').shape[0] + completed_fixtures.query(f'AwayTeam == "{team}" & HomeTeamScore == AwayTeamScore').shape[0]
+    team_record['losses'] = completed_fixtures.query(f'HomeTeam == "{team}" & HomeTeamScore < AwayTeamScore').shape[0] + completed_fixtures.query(f'AwayTeam == "{team}" & HomeTeamScore > AwayTeamScore').shape[0]
+    team_record['goals_for'] = completed_fixtures[completed_fixtures['HomeTeam'] == team]['HomeTeamScore'].sum() + completed_fixtures[completed_fixtures['AwayTeam'] == team]['AwayTeamScore'].sum() 
+    team_record['goals_against'] = completed_fixtures[completed_fixtures['HomeTeam'] == team]['AwayTeamScore'].sum() + completed_fixtures[completed_fixtures['AwayTeam'] == team]['HomeTeamScore'].sum()
+    return team_record
+
+
+def create_league_table(records):
+    current_table_df = pd.DataFrame.from_records(records)
+    current_table_df['points'] = 3 * current_table_df['wins'] + current_table_df['draws']
+    current_table_df['goal_difference'] = current_table_df['goals_for'] - current_table_df['goals_against']
+    current_table_df['max_points'] = (38 - current_table_df['played']) * 3 + current_table_df['points']
+    current_table_df = current_table_df.sort_values(['points', 'goal_difference', 'name'], ascending=[False, False, True]).reset_index(drop=True)
+    return current_table_df
+
+
+def create_xG_table(league="EPL", season="2024"):
+    understat = UnderstatClient()
+    league_team_data = understat.league(league=league).get_team_data(season=season)
+    all_teams_data = []
+    for key in league_team_data.keys():
+        team_data = {}
+        team_name = league_team_data[key]['title']
+        home_xG = 0.0
+        home_xGA = 0.0
+        home_played = 0
+        away_xG = 0.0
+        away_xGA = 0.0
+        away_played = 0
+        team_data['name'] = team_name
+        for match in league_team_data[key]['history']:
+            if match['h_a'] == 'h':
+                home_xG += match['xG']
+                home_xGA += match['xGA']
+                home_played += 1
+            elif match['h_a'] == 'a':
+                away_xG += match['xG']
+                away_xGA += match['xGA']
+                away_played += 1
+        team_data['home_xG_per_90'] = home_xG / home_played
+        team_data['home_xGA_per_90'] = home_xGA / home_played
+        team_data['away_xG_per_90'] = away_xG / away_played
+        team_data['away_xGA_per_90'] = away_xGA / away_played
+        all_teams_data.append(team_data)
+    xG_df = pd.DataFrame.from_records(all_teams_data)
+    xG_df['home_multiplier'] = xG_df['home_xGA_per_90'] / xG_df['home_xGA_per_90'].mean()
+    xG_df['away_multiplier'] = xG_df['away_xGA_per_90'] / xG_df['away_xGA_per_90'].mean()
+    return xG_df
+
+
+def simulate_league(table, fixtures, xgdf):
+    table = table.copy()
+    for fixture in fixtures:
+        home_mu = xgdf[xgdf['name'] == fixture['HomeTeam']].iloc[0]['home_xG_per_90'] * xgdf[xgdf['name'] == fixture['AwayTeam']].iloc[0]['away_multiplier']
+        away_mu = xgdf[xgdf['name'] == fixture['AwayTeam']].iloc[0]['away_xG_per_90'] * xgdf[xgdf['name'] == fixture['HomeTeam']].iloc[0]['home_multiplier']
+        home_goals = poisson.rvs(home_mu)
+        away_goals = poisson.rvs(away_mu)
+        table.loc[table['name'] == fixture['HomeTeam'], 'played'] += 1
+        table.loc[table['name'] == fixture['AwayTeam'], 'played'] += 1
+        table.loc[table['name'] == fixture['HomeTeam'], 'goals_for'] += home_goals
+        table.loc[table['name'] == fixture['HomeTeam'], 'goals_against'] += away_goals
+        table.loc[table['name'] == fixture['HomeTeam'], 'goal_difference'] += home_goals - away_goals
+        table.loc[table['name'] == fixture['AwayTeam'], 'goals_for'] += away_goals
+        table.loc[table['name'] == fixture['AwayTeam'], 'goals_against'] += home_goals
+        table.loc[table['name'] == fixture['AwayTeam'], 'goal_difference'] += away_goals - home_goals
+        if home_goals > away_goals:
+            table.loc[table['name'] == fixture['HomeTeam'], 'wins'] += 1
+            table.loc[table['name'] == fixture['HomeTeam'], 'points'] += 3
+            table.loc[table['name'] == fixture['AwayTeam'], 'max_points'] -= 3
+        elif home_goals == away_goals:
+            table.loc[table['name'] == fixture['HomeTeam'], 'draws'] += 1
+            table.loc[table['name'] == fixture['HomeTeam'], 'points'] += 1
+            table.loc[table['name'] == fixture['HomeTeam'], 'max_points'] -= 2
+            table.loc[table['name'] == fixture['AwayTeam'], 'draws'] += 1
+            table.loc[table['name'] == fixture['AwayTeam'], 'points'] += 1
+            table.loc[table['name'] == fixture['AwayTeam'], 'max_points'] -= 2
+        elif home_goals < away_goals:
+            table.loc[table['name'] == fixture['AwayTeam'], 'wins'] += 1
+            table.loc[table['name'] == fixture['AwayTeam'], 'points'] += 3
+            table.loc[table['name'] == fixture['HomeTeam'], 'max_points'] -= 3
+        table.sort_values(['points', 'goal_difference', 'name'], ascending=[False, False, True], inplace=True)
+        table.reset_index(drop=True, inplace=True)
+        top_removed = table.iloc[1:]
+        max_max_points = top_removed['max_points'].max()
+        if ('match_won' not in table.columns) and table.loc[0, 'points'] > max_max_points:
+            table['match_won'] = fixture['MatchNumber']
+    if 'match_won' in table.columns:
+        match_won = table.loc[0, 'match_won']
+    else:
+        match_won = 'final'
+    outcome = {
+        'winner': table.loc[0, 'name'],
+        'winner_points': table.loc[0, 'points'],
+        'second': table.loc[1, 'name'],
+        'second_points': table.loc[1, 'points'],
+        'match_won': match_won
+    }
+    return outcome
+
+
+def run_multiple_simulations(number_of_simulations, current_table, fixtures, xgdf):
+    num_cores = multiprocessing.cpu_count()
+    pool = multiprocessing.Pool(num_cores)
+    results = pool.starmap(simulate_league, [(current_table, fixtures, xgdf) for _ in range(number_of_simulations)])
+    pool.close()
+    pool.join()
+    return results
+
+
+if __name__ == '__main__':
+    all_teams, completed_fixtures, upcoming_fixtures = create_fixtures_teams(FIXTURES_URL)
+    team_records = [create_team_record(team=team, completed_fixtures=completed_fixtures) for team in all_teams]
+    current_league_table = create_league_table(team_records)
+    xG_df = create_xG_table()
+    outcomes = run_multiple_simulations(200, current_league_table, upcoming_fixtures, xG_df)
+    outcome_df = pd.DataFrame.from_records(outcomes)
+    outcome_df.to_csv('outcome2.csv')
